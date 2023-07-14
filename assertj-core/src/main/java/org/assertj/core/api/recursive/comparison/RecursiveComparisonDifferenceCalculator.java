@@ -308,9 +308,16 @@ public class RecursiveComparisonDifferenceCalculator {
   }
 
   private static void compareAtomicType(DualValue dualValue, ComparisonState comparisonState) {
-    if (!actualFieldValueEqualsExpectedFieldValue(dualValue)) {
+    if (isExpectedFieldAnAtomicType(dualValue) && !actualFieldValueEqualsExpectedFieldValue(dualValue)) {
       comparisonState.addDifference(dualValue);
     }
+  }
+
+  private static boolean actualFieldValueEqualsExpectedFieldValue(DualValue dualValue) {
+    if (dualValue.actual == null || dualValue.expected == null) {
+      return dualValue.actual == dualValue.expected;
+    }
+    return dualValue.actual.equals(dualValue.expected);
   }
 
   private static void registerVisitedDualValue(DualValue dualValue, ComparisonState comparisonState) {
@@ -325,13 +332,6 @@ public class RecursiveComparisonDifferenceCalculator {
       || dualValue.expected instanceof AtomicLongArray
       || dualValue.expected instanceof AtomicReference
       || dualValue.expected instanceof AtomicReferenceArray;
-  }
-
-  private static boolean actualFieldValueEqualsExpectedFieldValue(DualValue dualValue) {
-    if (dualValue.actual == null || dualValue.expected == null) {
-      return dualValue.actual == dualValue.expected;
-    }
-    return dualValue.actual.equals(dualValue.expected);
   }
 
   // avoid comparing enum recursively since they contain static fields which are ignored in recursive comparison
