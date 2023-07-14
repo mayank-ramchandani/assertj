@@ -199,17 +199,17 @@ public class RecursiveComparisonDifferenceCalculator {
 
   // TODO keep track of ignored fields in an RecursiveComparisonExecution class ?
 
-  private static List<ComparisonDifference> determineDifferences(Object actual, Object expected, FieldLocation fieldLocation,
+  private static List<ComparisonDifference> determineDifferences(Object actual, Object expected,
+                                                                 FieldLocation fieldLocation,
                                                                  VisitedDualValues visitedDualValues,
                                                                  RecursiveComparisonConfiguration recursiveComparisonConfiguration) {
     ComparisonState comparisonState = new ComparisonState(visitedDualValues, recursiveComparisonConfiguration);
     comparisonState.initDualValuesToCompare(actual, expected, fieldLocation);
 
     while (comparisonState.hasDualValuesToCompare()) {
+      DualValue dualValue = comparisonState.pickDualValueToCompare();
+      Optional<List<ComparisonDifference>> comparisonDifferences = getRegisteredComparisonDifferences(dualValue, comparisonState);
 
-      final DualValue dualValue = comparisonState.pickDualValueToCompare();
-      // if we have already visited the dual value, no need to compute the comparison differences again, this also avoid cycles
-      Optional<List<ComparisonDifference>> comparisonDifferences = comparisonState.visitedDualValues.registeredComparisonDifferencesOf(dualValue);
       if (comparisonDifferences.isPresent()) {
         if (!comparisonDifferences.get().isEmpty()) {
           comparisonState.addDifference(dualValue, "already visited node but now location is: " + dualValue.fieldLocation);
@@ -217,150 +217,121 @@ public class RecursiveComparisonDifferenceCalculator {
         continue;
       }
 
-      // first time we evaluate this dual value, perform the usual recursive comparison from there
+      processDualValue(dualValue, comparisonState, recursiveComparisonConfiguration);
+    }
 
-      if (dualValue.hasPotentialCyclingValues()) {
-        // visited dual values are tracked to avoid cycle, java types don't have cycle => no need to keep track of them.
-        // moreover this would make should_fix_1854_minimal_test to fail (see the test for a detailed explanation)
-        comparisonState.visitedDualValues.registerVisitedDualValue(dualValue);
-      }
+    return comparisonState.getDifferences();
+  }
 
-      final Object actualFieldValue = dualValue.actual;
-      final Object expectedFieldValue = dualValue.expected;
+  private static void processDualValue(DualValue dualValue, ComparisonState comparisonState,
+                                       RecursiveComparisonConfiguration recursiveComparisonConfiguration) {
+    if (dualValue.hasPotentialCyclingValues()) {
+      registerVisitedDualValue(dualValue, comparisonState);
+    }
 
-      // Custom comparators take precedence over all other types of comparison
-      if (recursiveComparisonConfiguration.hasCustomComparator(dualValue)) {
-        if (!areDualValueEqual(dualValue, recursiveComparisonConfiguration)) comparisonState.addDifference(dualValue);
-        // since we used a custom comparator we don't need to inspect the nested fields any further
-        continue;
-      }
+    final Object actualFieldValue = dualValue.actual;
+    final Object expectedFieldValue = dualValue.expected;
 
-      if (actualFieldValue == expectedFieldValue) continue;
+    if (recursiveComparisonConfiguration.hasCustomComparator(dualValue)) {
+      compareWithCustomComparator(dualValue, comparisonState, recursiveComparisonConfiguration);
+    } else if (actualFieldValue == expectedFieldValue) {
+      // Do nothing, values are the same
+    } else if (actualFieldValue == null || expectedFieldValue == null) {
+      comparisonState.addDifference(dualValue);
+    } else if (dualValue.isExpectedAnEnum() || dualValue.isActualAnEnum()) {
+      compareAsEnums(dualValue, comparisonState, recursiveComparisonConfiguration);
+    } else if (dualValue.isExpectedFieldAnArray()) {
+      compareArrays(dualValue, comparisonState);
+    } else if (dualValue.isExpectedFieldAnOrderedCollection() && !recursiveComparisonConfiguration.shouldIgnoreCollectionOrder(dualValue.fieldLocation)) {
+      compareOrderedCollections(dualValue, comparisonState);
+    } else if (dualValue.isExpectedFieldAnIterable()) {
+      compareUnorderedIterables(dualValue, comparisonState);
+    } else if (dualValue.isExpectedFieldAnOptional()) {
+      compareOptional(dualValue, comparisonState);
+    } else if (dualValue.isExpectedFieldASortedMap()) {
+      compareSortedMap(dualValue, comparisonState);
+    } else if (dualValue.isExpectedFieldAMap()) {
+      compareUnorderedMap(dualValue, comparisonState);
+    } else if (isExpectedFieldAnAtomicType(dualValue)) {
+      compareAtomicType(dualValue, comparisonState);
+    } else if (shouldHonorEquals(dualValue, recursiveComparisonConfiguration)) {
+      compareWithEqualsMethod(dualValue, comparisonState);
+    } else if (expectedTypeIsNotSubtypeOfActualType(dualValue)) {
+      comparisonState.addDifference(dualValue,
+        format(STRICT_TYPE_ERROR, dualValue.expected.getClass().getName(), dualValue.actual.getClass().getName()));
+    } else {
+      compareChildrenNodes(dualValue, comparisonState, recursiveComparisonConfiguration);
+    }
+  }
 
-      if (actualFieldValue == null || expectedFieldValue == null) {
-        // one of the value is null while the other is not as we already know that actualFieldValue != expectedFieldValue
-        comparisonState.addDifference(dualValue);
-        continue;
-      }
+  private static Optional<List<ComparisonDifference>> getRegisteredComparisonDifferences(DualValue dualValue, ComparisonState comparisonState) {
+    return comparisonState.visitedDualValues.registeredComparisonDifferencesOf(dualValue);
+  }
 
-      if (dualValue.isExpectedAnEnum()) {
-        compareAsEnums(dualValue, comparisonState, recursiveComparisonConfiguration);
-        continue;
-      }
-      if (dualValue.isActualAnEnum()) {
-        compareAsEnums(dualValue, comparisonState, recursiveComparisonConfiguration);
-        continue;
-      }
-      // TODO move hasFieldTypesDifference check into each compareXXX
+  private static void compareWithCustomComparator(DualValue dualValue, ComparisonState comparisonState, RecursiveComparisonConfiguration recursiveComparisonConfiguration) {
+    if (!areDualValueEqual(dualValue, recursiveComparisonConfiguration)) {
+      comparisonState.addDifference(dualValue);
+    }
+  }
 
-      if (dualValue.isExpectedFieldAnArray()) {
-        compareArrays(dualValue, comparisonState);
-        continue;
-      }
+  private static void compareWithEqualsMethod(DualValue dualValue, ComparisonState comparisonState) {
+    if (!dualValue.actual.equals(dualValue.expected)) {
+      comparisonState.addDifference(dualValue);
+    }
+  }
 
-      // we compare ordered collections specifically as to be matching, each pair of elements at a given index must match.
-      // concretely we compare: (col1[0] vs col2[0]), (col1[1] vs col2[1])...(col1[n] vs col2[n])
-      if (dualValue.isExpectedFieldAnOrderedCollection()
-          && !recursiveComparisonConfiguration.shouldIgnoreCollectionOrder(dualValue.fieldLocation)) {
-        compareOrderedCollections(dualValue, comparisonState);
-        continue;
-      }
+  private static void compareChildrenNodes(DualValue dualValue, ComparisonState comparisonState, RecursiveComparisonConfiguration recursiveComparisonConfiguration) {
+    Set<String> actualChildrenNodeNamesToCompare = recursiveComparisonConfiguration.getActualChildrenNodeNamesToCompare(dualValue);
+    Set<String> expectedChildrenNodesNames = recursiveComparisonConfiguration.getChildrenNodeNamesOf(dualValue.expected);
 
-      if (dualValue.isExpectedFieldAnIterable()) {
-        compareUnorderedIterables(dualValue, comparisonState);
-        continue;
-      }
-
-      if (dualValue.isExpectedFieldAnOptional()) {
-        compareOptional(dualValue, comparisonState);
-        continue;
-      }
-
-      // Compare two SortedMaps taking advantage of the fact that these Maps can be compared in O(N) time due to their ordering
-      if (dualValue.isExpectedFieldASortedMap()) {
-        compareSortedMap(dualValue, comparisonState);
-        continue;
-      }
-
-      // Compare two Unordered Maps. This is a slightly more expensive comparison because order cannot be assumed, therefore a
-      // temporary Map must be created, however the comparison still runs in O(N) time.
-      if (dualValue.isExpectedFieldAMap()) {
-        compareUnorderedMap(dualValue, comparisonState);
-        continue;
-      }
-
-      // compare Atomic types by value manually as they are container type and we can't use introspection in java 17+
-      if (dualValue.isExpectedFieldAnAtomicBoolean()) {
-        compareAtomicBoolean(dualValue, comparisonState);
-        continue;
-      }
-      if (dualValue.isExpectedFieldAnAtomicInteger()) {
-        compareAtomicInteger(dualValue, comparisonState);
-        continue;
-      }
-      if (dualValue.isExpectedFieldAnAtomicIntegerArray()) {
-        compareAtomicIntegerArray(dualValue, comparisonState);
-        continue;
-      }
-      if (dualValue.isExpectedFieldAnAtomicLong()) {
-        compareAtomicLong(dualValue, comparisonState);
-        continue;
-      }
-      if (dualValue.isExpectedFieldAnAtomicLongArray()) {
-        compareAtomicLongArray(dualValue, comparisonState);
-        continue;
-      }
-      if (dualValue.isExpectedFieldAnAtomicReference()) {
-        compareAtomicReference(dualValue, comparisonState);
-        continue;
-      }
-      if (dualValue.isExpectedFieldAnAtomicReferenceArray()) {
-        compareAtomicReferenceArray(dualValue, comparisonState);
-        continue;
-      }
-
-      if (shouldHonorEquals(dualValue, recursiveComparisonConfiguration)) {
-        if (!actualFieldValue.equals(expectedFieldValue)) comparisonState.addDifference(dualValue);
-        continue;
-      }
-
-      Class<?> actualFieldValueClass = actualFieldValue.getClass();
-      Class<?> expectedFieldClass = expectedFieldValue.getClass();
-      if (recursiveComparisonConfiguration.isInStrictTypeCheckingMode() && expectedTypeIsNotSubtypeOfActualType(dualValue)) {
-        comparisonState.addDifference(dualValue,
-                                      format(STRICT_TYPE_ERROR, expectedFieldClass.getName(), actualFieldValueClass.getName()));
-        continue;
-      }
-
-      Set<String> actualChildrenNodeNamesToCompare = recursiveComparisonConfiguration.getActualChildrenNodeNamesToCompare(dualValue);
-      Set<String> expectedChildrenNodesNames = recursiveComparisonConfiguration.getChildrenNodeNamesOf(expectedFieldValue);
-      // Check if expected has more children nodes than actual, in that case the additional nodes are reported as difference
-      if (!expectedChildrenNodesNames.containsAll(actualChildrenNodeNamesToCompare)) {
-        // report missing nodes in actual
-        Set<String> actualNodesNamesNotInExpected = newHashSet(actualChildrenNodeNamesToCompare);
-        actualNodesNamesNotInExpected.removeAll(expectedChildrenNodesNames);
-        String missingNodes = actualNodesNamesNotInExpected.toString();
-        String expectedClassName = expectedFieldClass.getName();
-        String actualClassName = actualFieldValueClass.getName();
-        String missingNodesDescription = format(MISSING_FIELDS, actualClassName, expectedClassName,
-                                                expectedFieldClass.getSimpleName(), actualFieldValueClass.getSimpleName(),
-                                                missingNodes);
-        comparisonState.addDifference(dualValue, missingNodesDescription);
-      } else { // TODO remove else to report more diff
-        // compare actual's children nodes against expected:
-        // - if actual has more nodes than expected, the additional nodes are ignored as expected is the reference
-        for (String actualChildNodeName : actualChildrenNodeNamesToCompare) {
-          if (expectedChildrenNodesNames.contains(actualChildNodeName)) {
-            Object actualChildNodeValue = recursiveComparisonConfiguration.getValue(actualChildNodeName, actualFieldValue);
-            Object expectedChildNodeValue = recursiveComparisonConfiguration.getValue(actualChildNodeName, expectedFieldValue);
-            DualValue newDualValue = new DualValue(dualValue.fieldLocation.field(actualChildNodeName),
-                                                   actualChildNodeValue, expectedChildNodeValue);
-            comparisonState.registerForComparison(newDualValue);
-          }
+    if (!expectedChildrenNodesNames.containsAll(actualChildrenNodeNamesToCompare)) {
+      Set<String> actualNodesNamesNotInExpected = newHashSet(actualChildrenNodeNamesToCompare);
+      actualNodesNamesNotInExpected.removeAll(expectedChildrenNodesNames);
+      String missingNodes = actualNodesNamesNotInExpected.toString();
+      String expectedClassName = dualValue.expected.getClass().getName();
+      String actualClassName = dualValue.actual.getClass().getName();
+      String missingNodesDescription = format(MISSING_FIELDS, actualClassName, expectedClassName,
+        dualValue.expected.getClass().getSimpleName(), dualValue.actual.getClass().getSimpleName(),
+        missingNodes);
+      comparisonState.addDifference(dualValue, missingNodesDescription);
+    } else {
+      for (String actualChildNodeName : actualChildrenNodeNamesToCompare) {
+        if (expectedChildrenNodesNames.contains(actualChildNodeName)) {
+          Object actualChildNodeValue = recursiveComparisonConfiguration.getValue(actualChildNodeName, dualValue.actual);
+          Object expectedChildNodeValue = recursiveComparisonConfiguration.getValue(actualChildNodeName, dualValue.expected);
+          DualValue newDualValue = new DualValue(dualValue.fieldLocation.field(actualChildNodeName),
+            actualChildNodeValue, expectedChildNodeValue);
+          comparisonState.registerForComparison(newDualValue);
         }
       }
     }
-    return comparisonState.getDifferences();
+  }
+
+  private static void compareAtomicType(DualValue dualValue, ComparisonState comparisonState) {
+    if (!actualFieldValueEqualsExpectedFieldValue(dualValue)) {
+      comparisonState.addDifference(dualValue);
+    }
+  }
+
+  private static void registerVisitedDualValue(DualValue dualValue, ComparisonState comparisonState) {
+    comparisonState.visitedDualValues.registerVisitedDualValue(dualValue);
+  }
+
+  private static boolean isExpectedFieldAnAtomicType(DualValue dualValue) {
+    return dualValue.expected instanceof AtomicBoolean
+      || dualValue.expected instanceof AtomicInteger
+      || dualValue.expected instanceof AtomicIntegerArray
+      || dualValue.expected instanceof AtomicLong
+      || dualValue.expected instanceof AtomicLongArray
+      || dualValue.expected instanceof AtomicReference
+      || dualValue.expected instanceof AtomicReferenceArray;
+  }
+
+  private static boolean actualFieldValueEqualsExpectedFieldValue(DualValue dualValue) {
+    if (dualValue.actual == null || dualValue.expected == null) {
+      return dualValue.actual == dualValue.expected;
+    }
+    return dualValue.actual.equals(dualValue.expected);
   }
 
   // avoid comparing enum recursively since they contain static fields which are ignored in recursive comparison
